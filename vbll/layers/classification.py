@@ -60,17 +60,27 @@ class DiscClassification(nn.Module):
                  softmax_bound_empirical=None,
                  return_ood=False,
                  prior_scale=1.,
+                 width_scale=None,
+                 wumean_scale=None,
+                 wulogdiag_scale=None,
+                 wuoffdiag_scale=None,
+                 noise_label=True,
                  wishart_scale=1.,
                  cov_rank=None,
                  dof=1.):
         super(DiscClassification, self).__init__()
 
+        self.width_scale = width_scale if width_scale is not None else (2./in_features)
+        self.wumean_scale = np.sqrt(self.width_scale) if wumean_scale is None else wumean_scale
+        self.wulogdiag_scale = wulogdiag_scale if wulogdiag_scale is not None else -2*np.log(in_features)
+        self.wuoffdiag_scale = wuoffdiag_scale if wuoffdiag_scale is not None else 0.01
+        self.noise_label = noise_label
         self.wishart_scale = wishart_scale
         self.dof = (dof + out_features + 1.)/2.
         self.regularization_weight = regularization_weight
 
         # define prior, currently fixing zero mean and arbitrarily scaled cov
-        self.prior_scale = prior_scale
+        self.prior_scale = prior_scale * self.width_scale
 
         # noise distribution
         self.noise_mean = nn.Parameter(torch.zeros(out_features), requires_grad = False)
@@ -78,13 +88,13 @@ class DiscClassification(nn.Module):
 
         # last layer distribution
         self.W_dist = get_parameterization(parameterization)
-        self.W_mean = nn.Parameter(torch.randn(out_features, in_features))
+        self.W_mean = nn.Parameter(torch.randn(out_features, in_features) * self.wumean_scale)
 
-        self.W_logdiag = nn.Parameter(torch.randn(out_features, in_features) - 0.5 * np.log(in_features))
+        self.W_logdiag = nn.Parameter(torch.randn(out_features, in_features) - self.wulogdiag_scale) # - 0.5 * np.log(in_features))
         if parameterization == 'dense':
-            self.W_offdiag = nn.Parameter(torch.randn(out_features, in_features, in_features)/in_features)
+            self.W_offdiag = nn.Parameter(self.wuoffdiag_scale * torch.randn(out_features, in_features, in_features)/in_features)
         elif parameterization == 'lowrank':
-            self.W_offdiag = nn.Parameter(torch.randn(out_features, in_features, cov_rank)/in_features)
+            self.W_offdiag = nn.Parameter(self.wuoffdiag_scale * torch.randn(out_features, in_features, cov_rank)/in_features)
         
         self.softmax_bound = softmax_bound
 
@@ -151,7 +161,7 @@ class DiscClassification(nn.Module):
         return out
 
     def logit_predictive(self, x):
-        return (self.W() @ x[..., None]).squeeze(-1) + self.noise()
+        return (self.W() @ x[..., None]).squeeze(-1) + self.noise() * int(self.noise_label)
 
     def predictive(self, x, n_samples = 10):
         softmax_samples = F.softmax(self.logit_predictive(x).rsample(sample_shape=torch.Size([n_samples])), dim=-1)
@@ -164,6 +174,7 @@ class DiscClassification(nn.Module):
 
             kl_term = KL(self.W(), self.prior_scale)
             wishart_term = (self.dof * noise.logdet_precision - 0.5 * self.wishart_scale * noise.trace_precision)
+            wishart_term = int(self.noise_label) * wishart_term
 
             total_elbo = torch.mean(self.bound(x, y, method, n_samples))
             total_elbo += self.regularization_weight * (wishart_term - kl_term)

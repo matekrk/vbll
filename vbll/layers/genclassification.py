@@ -45,10 +45,16 @@ class GenClassification(nn.Module):
                  softmax_bound_empirical=None,
                  return_ood=False,
                  prior_scale=1.,
+                 width_scale=1.0,
+                 mumean_scale=0.1,
+                 mulogiag_scale=1.,
+                 noise_label=True,
                  wishart_scale=1.,
                  dof=1.):
         super(GenClassification, self).__init__()
 
+        self.width_scale = width_scale if width_scale is not None else (2./in_features)
+        self.noise_label = noise_label
         self.wishart_scale = wishart_scale
         self.dof = (dof + in_features + 1.)/2.
         self.regularization_weight = regularization_weight
@@ -62,8 +68,8 @@ class GenClassification(nn.Module):
 
         # last layer distribution
         self.mu_dist = get_parameterization(parameterization)
-        self.mu_mean = nn.Parameter(0.1*torch.randn(out_features, in_features))
-        self.mu_logdiag = nn.Parameter(torch.randn(out_features, in_features))
+        self.mu_mean = nn.Parameter(mumean_scale*torch.randn(out_features, in_features))
+        self.mu_logdiag = nn.Parameter(mulogiag_scale*torch.randn(out_features, in_features))
         if parameterization == 'dense':
             raise NotImplementedError('Dense embedding cov not implemented for g-vbll')
 
@@ -147,7 +153,7 @@ class GenClassification(nn.Module):
         return torch.clip(F.softmax(self.logit_predictive(x), dim=-1), min=0., max=1.)
     
     def logit_predictive_likedisc(self, x, n_samples=10):
-        return torch.einsum("ijk,lk->ilj", (self.mu() + self.noise()).rsample(torch.Size([n_samples])), x)
+        return torch.einsum("ijk,lk->ilj", (self.mu() + (self.noise()*int(self.noise_label))  ).rsample(torch.Size([n_samples])), x)
     
     def predictive_likedisc(self, x, n_samples=10): # HERE WE SHOULD TAKE MEAN
         return torch.clip(F.softmax(self.logit_predictive_likedisc(x, n_samples), dim=-1), min=0., max=1.)
@@ -158,6 +164,7 @@ class GenClassification(nn.Module):
             noise = self.noise()
             kl_term = KL(self.mu(), self.prior_scale)
             wishart_term = (self.dof * noise.logdet_precision - 0.5 * self.wishart_scale * noise.trace_precision)
+            wishart_term = int(self.noise_label) * wishart_term
 
             total_elbo = torch.mean(self.bound(x, y, method, n_samples))
             total_elbo += self.regularization_weight * (wishart_term - kl_term)
