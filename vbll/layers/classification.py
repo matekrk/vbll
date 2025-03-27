@@ -55,10 +55,16 @@ class DiscClassification(nn.Module):
             Parameterization of covariance matrix. Currently supports {'dense', 'diagonal', 'lowrank'}
         softmax_bound : str
             Bound to use for softmax. Currently supports 'jensen'
+        return_empirical : bool
+            Whether to return empirical loss function ('montecarlo')
+        softmax_bound_empirical : str
+            Bound to use for empirical softmax. Currently supports 'montecarlo'
         return_ood : bool
             Whether to return OOD scores
         prior_scale : float
             Scale of prior covariance matrix
+        noise_label : bool
+            Whether to include noise label in output
         wishart_scale : float
             Scale of Wishart prior on noise covariance
         dof : float
@@ -72,13 +78,17 @@ class DiscClassification(nn.Module):
                  regularization_weight,
                  parameterization='dense',
                  softmax_bound='jensen',
+                 return_empirical=False,
+                 softmax_bound_empirical=None,
                  return_ood=False,
                  prior_scale=1.,
+                 noise_label=True,
                  wishart_scale=1.,
                  dof=1.,
                  cov_rank=3):
         super(DiscClassification, self).__init__()
 
+        self.noise_label = noise_label
         self.wishart_scale = wishart_scale
         self.dof = (dof + out_features + 1.)/2.
         self.regularization_weight = regularization_weight
@@ -100,10 +110,13 @@ class DiscClassification(nn.Module):
         elif parameterization == 'lowrank':
             self.W_offdiag = nn.Parameter(1e-3 * torch.randn(out_features, in_features, cov_rank)/in_features) # init off dim elements small
         
-        if softmax_bound == 'jensen':
-            self.softmax_bound = self.jensen_bound
+        self.softmax_bound = softmax_bound
+    
+        self.return_empirical = return_empirical
+        if self.return_empirical and softmax_bound_empirical == 'montecarlo':
+            self.softmax_bound_empirical = softmax_bound_empirical
         else:
-            raise NotImplementedError('Only semi-Monte Carlo is currently implemented.')
+            self.softmax_bound_empirical = None
 
         self.return_ood = return_ood
 
@@ -140,6 +153,16 @@ class DiscClassification(nn.Module):
         mean_over_samples = torch.mean(sampled_log_sm, dim=0)
         return mean_over_samples[torch.arange(x.shape[0]), y]
 
+    def bound(self, x, y, method=None, n_samples=100):
+        if method is None:
+            method = self.softmax_bound
+        if method == 'jensen':
+            return self.jensen_bound(x, y)
+        elif method == 'montecarlo':
+            return self.montecarlo_bound(x, y, n_samples)
+        else:
+            raise ValueError("Invalid method specified")
+
     # ----- forward and core ops
 
     def forward(self, x):
@@ -151,21 +174,26 @@ class DiscClassification(nn.Module):
         return out
 
     def logit_predictive(self, x):
-        return (self.W() @ x[..., None]).squeeze(-1) + self.noise()
+        assert x.shape[-1] == self.W_mean.shape[-1] 
+        l = (self.W() @ x[..., None]).squeeze(-1)
+        if self.noise_label:
+            l = l + self.noise()
+        return l
 
     def predictive(self, x, n_samples = 20):
         softmax_samples = F.softmax(self.logit_predictive(x).rsample(sample_shape=torch.Size([n_samples])), dim=-1)
         return torch.clip(torch.mean(softmax_samples, dim=0),min=0.,max=1.)
 
-    def _get_train_loss_fn(self, x):
+    def _get_train_loss_fn(self, x, method):
 
-        def loss_fn(y):
+        def loss_fn(y, n_samples = None):
             noise = self.noise()
 
             kl_term = gaussian_kl(self.W(), self.prior_scale)
             wishart_term = (self.dof * noise.logdet_precision - 0.5 * self.wishart_scale * noise.trace_precision)
+            wishart_term = wishart_term * int(self.noise_label)
 
-            total_elbo = torch.mean(self.softmax_bound(x, y))
+            total_elbo = torch.mean(self.bound(x, y, method, n_samples))
             total_elbo += self.regularization_weight * (wishart_term - kl_term)
             return -total_elbo
 
@@ -558,10 +586,16 @@ class GenClassification(nn.Module):
             Parameterization of covariance matrix. Currently supports 'dense' and 'diagonal'
         softmax_bound : str
             Bound to use for softmax. Currently supports 'jensen'
+        return_empirical : bool
+            Whether to return empirical loss function ('montecarlo')
+        softmax_bound_empirical : str
+            Bound to use for empirical softmax. Currently supports 'montecarlo'
         return_ood : bool
             Whether to return OOD scores
         prior_scale : float
             Scale of prior covariance matrix
+        noise_label : bool
+            Whether to include noise label in output
         wishart_scale : float
             Scale of Wishart prior on noise covariance
         dof : float
@@ -573,13 +607,17 @@ class GenClassification(nn.Module):
                  regularization_weight,
                  parameterization='dense',
                  softmax_bound='jensen',
+                 return_empirical=False,
+                 softmax_bound_empirical=None,
                  return_ood=False,
                  prior_scale=1.,
+                 noise_label=True,
                  wishart_scale=1.,
                  dof=1.):
         super(GenClassification, self).__init__()
 
         self.wishart_scale = wishart_scale
+        self.noise_label = noise_label
         self.dof = (dof + in_features + 1.)/2.
         self.regularization_weight = regularization_weight
 
@@ -597,8 +635,13 @@ class GenClassification(nn.Module):
         if parameterization == 'dense':
             raise NotImplementedError('Dense embedding cov not implemented for g-vbll')
 
-        if softmax_bound == 'jensen':
-            self.softmax_bound = self.jensen_bound
+        self.softmax_bound = softmax_bound
+
+        self.return_empirical = return_empirical
+        if self.return_empirical and softmax_bound_empirical == 'montecarlo':
+            self.softmax_bound_empirical = softmax_bound_empirical
+        else:
+            self.softmax_bound_empirical = None
 
         self.return_ood = return_ood
 
@@ -631,14 +674,26 @@ class GenClassification(nn.Module):
     def montecarlo_bound(self, x, y, n_samples=10):
         # TODO(jamesharrison)
         raise NotImplementedError('Monte carlo bound not implemented for g-vbll')
+    
+    def bound(self, x, y, method=None, n_samples=100):
+        if method is None:
+            method = self.softmax_bound
+        if method == 'jensen':
+            return self.jensen_bound(x, y)
+        elif method == 'montecarlo':
+            assert n_samples is not None
+            return self.montecarlo_bound(x, y, n_samples)
+        else:
+            raise ValueError("Invalid method specified")
 
     # ----- forward and core ops
 
     def forward(self, x):
         # TODO(jamesharrison): add assert on shape of x input
         out = VBLLReturn(torch.distributions.Categorical(probs = self.predictive(x)),
-                          self._get_train_loss_fn(x),
+                          self._get_train_loss_fn(x, method=self.softmax_bound),
                           self._get_val_loss_fn(x))
+        if self.return_empirical: out.train_loss_fn_empirical = self._get_train_loss_fn(x, method=self.softmax_bound_empirical)
         if self.return_ood: out.ood_scores = self.max_predictive(x)
         return out
 
@@ -653,14 +708,20 @@ class GenClassification(nn.Module):
     def predictive(self, x):
         return torch.clip(F.softmax(self.logit_predictive(x), dim=-1), min=0., max=1.)
 
-    def _get_train_loss_fn(self, x):
+    def logit_predictive_likedisc(self, x, n_samples=10):
+        return torch.einsum("ijk,lk->ilj", (self.mu() + (self.noise()*int(self.noise_label))  ).rsample(torch.Size([n_samples])), x)
 
-        def loss_fn(y):
+    def predictive_likedisc(self, x, n_samples=10):
+        return torch.clip(F.softmax(self.logit_predictive_likedisc(x, n_samples), dim=-1), min=0., max=1.)
+
+    def _get_train_loss_fn(self, x, method):
+
+        def loss_fn(y, n_samples = None):
             noise = self.noise()
             kl_term = gaussian_kl(self.mu(), self.prior_scale)
             wishart_term = (self.dof * noise.logdet_precision - 0.5 * self.wishart_scale * noise.trace_precision)
 
-            total_elbo = torch.mean(self.softmax_bound(x, y))
+            total_elbo = torch.mean(self.bound(x, y, method, n_samples))
             total_elbo += self.regularization_weight * (wishart_term - kl_term)
             return -total_elbo
 
