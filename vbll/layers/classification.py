@@ -1,3 +1,4 @@
+from typing import Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,7 @@ class VBLLReturn():
     train_loss_fn: Callable[[torch.Tensor], torch.Tensor]
     val_loss_fn: Callable[[torch.Tensor], torch.Tensor]
     ood_scores: None | Callable[[torch.Tensor], torch.Tensor] = None
+    train_loss_fn_empirical: Union[None, Callable[[torch.Tensor], torch.Tensor]] = None
 
 class DiscClassification(nn.Module):
     """Variational Bayesian Disciminative Classification
@@ -168,8 +170,9 @@ class DiscClassification(nn.Module):
     def forward(self, x):
         # TODO(jamesharrison): add assert on shape of x input
         out = VBLLReturn(torch.distributions.Categorical(probs = self.predictive(x)),
-                          self._get_train_loss_fn(x),
+                          self._get_train_loss_fn(x, method=self.softmax_bound),
                           self._get_val_loss_fn(x))
+        if self.return_empirical: out.train_loss_fn_empirical = self._get_train_loss_fn(x, method=self.softmax_bound_empirical)
         if self.return_ood: out.ood_scores = self.max_predictive(x)
         return out
 
