@@ -324,7 +324,7 @@ class LowRankNormal(torch.distributions.LowRankMultivariateNormal):
         # Apply Matrix determinant lemma
         term1 = torch.log(self.cov_diag).sum(-1)
         arg1 = tp(self.cov_factor) @ (self.cov_factor/self.cov_diag.unsqueeze(-1))
-        term2 = torch.linalg.det(arg1 + torch.eye(arg1.shape[-1])).log()
+        term2 = torch.linalg.det(arg1 + torch.eye(arg1.shape[-1], device=arg1.device)).log()
         return term1 + term2
 
     @property
